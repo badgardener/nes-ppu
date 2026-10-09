@@ -10,7 +10,7 @@
  *
  * The PPU is represented as an explicit machine state. Its registers,
  * scrolling state, background pipeline, sprite evaluation state,
- * memory bus, timing counters, DMA state, I/O latches, rendering state,
+ * memory bus, timing counters, I/O latches, rendering state,
  * interrupt state, and temporary values are exposed through the
  * NES_PPU structure so that the emulator can operate at cycle granularity.
  *
@@ -23,29 +23,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/**
- * Signed 8-bit integer.
- */
 typedef int8_t byte;
-
-/**
- * Signed 16-bit integer.
- */
 typedef int16_t word;
-
-/**
- * Unsigned 8-bit integer.
- */
 typedef uint8_t ubyte;
-
-/**
- * Unsigned 16-bit integer.
- */
 typedef uint16_t uword;
-
-/**
- * Unsigned counter used for cycle and frame counts.
- */
 typedef uint64_t counter;
 
 #endif // NES_BIN_DATATYPES
@@ -64,23 +45,25 @@ typedef struct PPU_MemoryBus PPU_MemoryBus;
 #define NES_REGIONS
 
 typedef enum NES_Regions {
-  /**
-   * NTSC timing region.
-   */
   REGION_NTSC,
-
-  /**
-   * PAL timing region.
-   */
   REGION_PAL,
-
-  /**
-   * Dendy timing region.
-   */
   REGION_DENDY,
 } NES_Regions;
 
 #endif // NES_REGIONS
+
+/**
+ * Regional RGB color palettes.
+ *
+ * Each palette contains 64 RGB colors, with three bytes per color.
+ * The definitions are provided by the PPU implementation or a dedicated
+ * palette source file. RRGGBB
+ */
+extern const ubyte NTSC_COLOR_PALETTE[64 * 3];
+
+extern const ubyte PAL_COLOR_PALETTE[64 * 3];
+
+extern const ubyte DENDY_COLOR_PALETTE[64 * 3];
 
 /**
  * Nametable mirroring configuration.
@@ -89,29 +72,10 @@ typedef enum NES_Regions {
  * nametable memory.
  */
 typedef enum PPU_Mirroring {
-  /**
-   * Four-screen nametable arrangement.
-   */
   MIRROR_FOURSCREEN,
-
-  /**
-   * Horizontal nametable mirroring.
-   */
   MIRROR_HORIZONTAL,
-
-  /**
-   * Vertical nametable mirroring.
-   */
   MIRROR_VERTICAL,
-
-  /**
-   * Single-screen mirroring mapped to the first nametable.
-   */
   MIRROR_SINGLE0,
-
-  /**
-   * Single-screen mirroring mapped to the second nametable.
-   */
   MIRROR_SINGLE1,
 } PPU_Mirroring;
 
@@ -125,6 +89,16 @@ typedef enum PPU_Mirroring {
  * at cycle granularity.
  */
 typedef struct NES_PPU {
+  /**
+   * PPU total steps.
+   */
+  counter steps;
+
+  /**
+   * Regional color palette selected.
+   */
+  const ubyte *PALETTE;
+
   /**
    * CPU-visible PPU registers.
    */
@@ -159,36 +133,6 @@ typedef struct NES_PPU {
      * Selects the primary OAM byte accessed by OAMDATA.
      */
     ubyte OAMADDR;
-
-    /**
-     * OAM data register ($2004).
-     *
-     * Provides CPU access to primary OAM.
-     */
-    ubyte OAMDATA;
-
-    /**
-     * Scroll register ($2005).
-     *
-     * Accepts horizontal and vertical scroll components through the
-     * shared two-write register interface.
-     */
-    ubyte PPUSCROLL;
-
-    /**
-     * VRAM address register ($2006).
-     *
-     * Accepts the high and low portions of the CPU-specified PPU address.
-     */
-    ubyte PPUADDR;
-
-    /**
-     * VRAM data register ($2007).
-     *
-     * Provides CPU access to PPU memory through the internal read buffer
-     * and address increment mechanism.
-     */
-    ubyte PPUDATA;
   } reg;
 
   /**
@@ -219,14 +163,6 @@ typedef struct NES_PPU {
      * Selects the starting bit within the background pattern shifters.
      */
     ubyte fine_x;
-
-    /**
-     * First-or-second write toggle.
-     *
-     * False indicates that the next write is the first write; true
-     * indicates that the next write is the second write.
-     */
-    bool w;
   } loopy;
 
   /**
@@ -313,11 +249,6 @@ typedef struct NES_PPU {
     ubyte secondary_oam[32];
 
     /**
-     * Internal primary OAM address.
-     */
-    ubyte oam_addr;
-
-    /**
      * Current secondary OAM byte address.
      */
     ubyte secondary_oam_addr;
@@ -346,11 +277,6 @@ typedef struct NES_PPU {
      * Current secondary OAM write position.
      */
     ubyte eval_sec_addr;
-
-    /**
-     * Indicates that sprite overflow has been detected during evaluation.
-     */
-    bool eval_overflow;
 
     /**
      * Indicates that sprite evaluation has completed.
@@ -433,11 +359,6 @@ typedef struct NES_PPU {
     bool sprite_zero_rendering;
 
     /**
-     * Indicates that a sprite-zero hit has occurred.
-     */
-    bool sprite_zero_hit;
-
-    /**
      * Indicates that sprite evaluation detected overflow.
      */
     bool sprite_overflow;
@@ -472,16 +393,6 @@ typedef struct NES_PPU {
      * Holds buffered reads from PPU memory.
      */
     ubyte read_buffer;
-
-    /**
-     * Internal PPU memory I/O latch.
-     */
-    ubyte io_latch;
-
-    /**
-     * Palette-access I/O latch.
-     */
-    ubyte palette_io_latch;
   } bus;
 
   /**
@@ -552,54 +463,7 @@ typedef struct NES_PPU {
      * Current NMI signal line state.
      */
     bool nmi_line;
-
-    /**
-     * Indicates that an NMI request is pending.
-     */
-    bool nmi_pending;
   } timing;
-
-  /**
-   * OAM DMA transfer state.
-   *
-   * Represents the transfer of a CPU memory page into primary OAM.
-   */
-  struct dma {
-    /**
-     * Indicates that OAM DMA is active.
-     */
-    bool active;
-
-    /**
-     * Indicates that the DMA alignment or dummy phase is active.
-     */
-    bool dummy;
-
-    /**
-     * Indicates whether the current DMA phase reads source memory.
-     */
-    bool read_phase;
-
-    /**
-     * Source page selected for the DMA transfer.
-     */
-    ubyte page;
-
-    /**
-     * Current byte offset within the source page.
-     */
-    ubyte offset;
-
-    /**
-     * Byte temporarily held between a source read and OAM write.
-     */
-    ubyte data;
-
-    /**
-     * Number of DMA cycles elapsed.
-     */
-    counter cycles;
-  } dma;
 
   /**
    * PPU I/O state and register access latches.
@@ -621,19 +485,9 @@ typedef struct NES_PPU {
     ubyte io_bus_decay_counter[8];
 
     /**
-     * Fine horizontal scroll latch.
-     */
-    ubyte fine_x;
-
-    /**
      * Shared first-or-second write toggle for PPUSCROLL and PPUADDR.
      */
-    ubyte write_toggle;
-
-    /**
-     * Buffered value used by CPU reads from PPUDATA.
-     */
-    ubyte read_buffer;
+    bool write_toggle;
 
     /**
      * Most recently accessed CPU-visible PPU register.
@@ -701,27 +555,12 @@ typedef struct NES_PPU {
      * Indicates whether sprite rendering is enabled.
      */
     bool sprites_enabled;
-
-    /**
-     * Indicates whether background pixels should be rendered.
-     */
-    bool show_background;
-
-    /**
-     * Indicates whether sprite pixels should be rendered.
-     */
-    bool show_sprites;
   } render;
 
   /**
    * PPU non-maskable interrupt signal state.
    */
   struct interrupt {
-    /**
-     * Current NMI output line state.
-     */
-    bool nmi_line;
-
     /**
      * Indicates that an NMI edge is pending processing.
      */
@@ -748,11 +587,6 @@ typedef struct NES_PPU {
     bool reset_pending;
 
     /**
-     * Indicates that rendering is enabled by the current configuration.
-     */
-    bool rendering_enabled;
-
-    /**
      * Indicates that the vertical blank interval has started.
      */
     bool vblank_started;
@@ -772,61 +606,6 @@ typedef struct NES_PPU {
      */
     bool suppress_vblank;
   } state;
-
-  /**
-   * Temporary values used by PPU operations.
-   */
-  struct temp {
-    /**
-     * General-purpose temporary data byte.
-     */
-    ubyte data;
-
-    /**
-     * General-purpose temporary value.
-     */
-    ubyte value;
-
-    /**
-     * General-purpose temporary latch.
-     */
-    ubyte latch;
-
-    /**
-     * High byte of a temporary address.
-     */
-    ubyte address_high;
-
-    /**
-     * Low byte of a temporary address.
-     */
-    ubyte address_low;
-
-    /**
-     * General-purpose temporary address.
-     */
-    uword address;
-
-    /**
-     * Temporary VRAM or memory address.
-     */
-    uword temporary_address;
-
-    /**
-     * Address currently presented to the PPU memory bus.
-     */
-    uword bus_address;
-
-    /**
-     * Data currently presented to the PPU memory bus.
-     */
-    ubyte bus_data;
-
-    /**
-     * Indicates whether the current PPU memory bus operation is a write.
-     */
-    bool bus_write;
-  } temp;
 } NES_PPU;
 
 /**
@@ -853,6 +632,22 @@ void write_ppu_for_cpu(NES_PPU *p, ubyte reg, ubyte val);
 word read_ppu_for_cpu(NES_PPU *p, ubyte reg);
 
 /**
+ * Creates and initializes an NES PPU instance.
+ *
+ * The NES video timing region (NTSC, PAL, or Dendy).
+ * Pointer to the PPU memory bus.
+ * The nametable mirroring configuration.
+ * Return Pointer to the initialized NES_PPU instance.
+ */
+NES_PPU *build_nes_ppu(NES_Regions r, PPU_MemoryBus *b, PPU_Mirroring m);
+
+/**
+ * Resets the PPU to its initial state.
+ * Pointer to the NES_PPU instance to reset.
+ */
+void reset_nes_ppu(NES_PPU *p);
+
+/**
  * Advance the PPU by one clock dot.
  *
  * Advances PPU timing, rendering, memory accesses, sprite evaluation,
@@ -870,5 +665,10 @@ void clock_nes_ppu(NES_PPU *p);
  * Should be implemented in BUS. Return -1 by default.
  */
 word read_expansion_for_ppu(PPU_MemoryBus *membus, uword addr);
+
+/**
+ * Write to cartridge expansion memory through the PPU memory bus.
+ */
+void write_expansion_for_ppu(PPU_MemoryBus *membus, uword addr, uword val);
 
 #endif // NES_PPU_H
