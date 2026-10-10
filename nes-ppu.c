@@ -115,6 +115,12 @@ static inline void set_color_B(NES_PPU *p, uword px, ubyte B) {
   p->render.framebuffer[(px * 3) + 2] = B;
 }
 
+static inline void set_color_RGB(NES_PPU *p, uword px, ubyte i) {
+  set_color_R(p, px, get_color_R(p, i));
+  set_color_G(p, px, get_color_G(p, i));
+  set_color_B(p, px, get_color_B(p, i));
+}
+
 static void write_ppu(NES_PPU *p, uword addr, ubyte val) {
   addr &= 0x3FFF;
   p->io.open_bus = val;
