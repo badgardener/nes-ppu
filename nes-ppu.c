@@ -373,10 +373,417 @@ void reset_nes_ppu(NES_PPU *p) {
 }
 
 static void __clock_nes_ppu_ntsc(NES_PPU *p) {
-  /** ::TODO::
-   * Needs full dot accurate PPU clocking
-   * implementation.
-   */
+  uword scanline = p->timing.scanline;
+  uword dot = p->timing.dot;
+  bool rendering = p->render.background_enabled || p->render.sprites_enabled;
+  bool bg_enabled = p->render.background_enabled;
+  bool spr_enabled = p->render.sprites_enabled;
+  bool visible = scanline < 240;
+  bool prerender = scanline == 261;
+  bool render_line = visible || prerender;
+  bool fetch_line = render_line && rendering;
+
+  if (dot == 0) {
+    p->sprite.sprite_count = p->sprite.next_sprite_count;
+    p->sprite.sprite_zero_possible = p->sprite.sprite_zero_rendering;
+    p->sprite.sprite_zero_rendering = false;
+
+    for (int i = 0; i < 8; i++) {
+      p->sprite.x[i] = p->sprite.next_x[i];
+      p->sprite.attributes[i] = p->sprite.next_attributes[i];
+      p->sprite.pattern_low[i] = p->sprite.next_pattern_low[i];
+      p->sprite.pattern_high[i] = p->sprite.next_pattern_high[i];
+    }
+  }
+
+  if (render_line && dot >= 1 && dot <= 256 && visible) {
+    uword px = dot - 1;
+    p->render.pixel_x = px;
+    p->render.pixel_y = scanline;
+
+    ubyte bg_pixel = 0;
+    ubyte bg_palette = 0;
+
+    if (bg_enabled && (px >= 8 || p->render.left_background_enabled)) {
+      unsigned int shift = 15 - p->loopy.fine_x;
+      ubyte p0 = (p->bg.pattern_shift_low >> shift) & 1;
+      ubyte p1 = (p->bg.pattern_shift_high >> shift) & 1;
+      ubyte a0 = (p->bg.attribute_shift_low >> shift) & 1;
+      ubyte a1 = (p->bg.attribute_shift_high >> shift) & 1;
+
+      bg_pixel = (p1 << 1) | p0;
+      bg_palette = (a1 << 1) | a0;
+    }
+
+    ubyte spr_pixel = 0;
+    ubyte spr_palette = 0;
+    bool spr_priority = false;
+    bool spr_is_zero = false;
+
+    if (spr_enabled && (px >= 8 || p->render.left_sprites_enabled)) {
+      for (int i = 0; i < p->sprite.sprite_count && i < 8; i++) {
+        if (p->sprite.x[i] != 0) {
+          continue;
+        }
+
+        ubyte attr = p->sprite.attributes[i];
+        ubyte s0 = (p->sprite.pattern_low[i] >> 7) & 1;
+        ubyte s1 = (p->sprite.pattern_high[i] >> 7) & 1;
+        ubyte sp = (s1 << 1) | s0;
+
+        if (sp != 0) {
+          spr_pixel = sp;
+          spr_palette = 0x10 | ((attr & 3) << 2);
+          spr_priority = (attr & 0x20) != 0;
+          spr_is_zero = i == 0 && p->sprite.sprite_zero_possible;
+          break;
+        }
+      }
+    }
+
+    if (spr_is_zero && bg_pixel != 0 && spr_pixel != 0 && bg_enabled &&
+        spr_enabled && px != 255) {
+      p->reg.PPUSTATUS |= 0x40;
+    }
+
+    ubyte final_palette_index;
+
+    if (bg_pixel == 0 && spr_pixel == 0) {
+      final_palette_index = 0;
+    } else if (bg_pixel == 0) {
+      final_palette_index = spr_palette | spr_pixel;
+    } else if (spr_pixel == 0 || spr_priority) {
+      final_palette_index = (bg_palette << 2) | bg_pixel;
+    } else {
+      final_palette_index = spr_palette | spr_pixel;
+    }
+
+    ubyte pal_addr = mirror_palette(0x3F00 + final_palette_index);
+    ubyte color_idx = p->bus.palette_ram[pal_addr] & 0x3F;
+
+    if (p->render.grayscale) {
+      color_idx &= 0x30;
+    }
+
+    p->render.palette_index = final_palette_index;
+    p->render.color = color_idx;
+    set_color_RGB(p, px + scanline * 256, color_idx);
+  }
+
+  if (fetch_line && ((dot >= 1 && dot <= 256) || (dot >= 321 && dot <= 336))) {
+    p->bg.pattern_shift_low <<= 1;
+    p->bg.pattern_shift_high <<= 1;
+    p->bg.attribute_shift_low <<= 1;
+    p->bg.attribute_shift_high <<= 1;
+
+    if (bg_enabled) {
+      ubyte phase = (dot - 1) & 7;
+
+      if (phase == 0) {
+        ubyte tile = 0;
+        if (read_ppu(p, 0x2000 | (p->loopy.v & 0x0FFF), &tile)) {
+          p->bg.next_tile_id = tile;
+        } else {
+          p->bg.next_tile_id = 0;
+        }
+      } else if (phase == 2) {
+        uword v = p->loopy.v;
+        uword addr =
+            0x23C0 | (v & 0x0C00) | ((v >> 4) & 0x38) | ((v >> 2) & 0x07);
+        ubyte attr = 0;
+
+        if (read_ppu(p, addr, &attr)) {
+          ubyte shift = (ubyte)((((v >> 4) & 4) | (v & 2)) << 1);
+          p->bg.next_tile_attribute = (attr >> shift) & 3;
+        } else {
+          p->bg.next_tile_attribute = 0;
+        }
+      } else if (phase == 4 || phase == 6) {
+        uword fine_y = (p->loopy.v >> 12) & 7;
+        uword table = (p->reg.PPUCTRL & 0x10) ? 0x1000 : 0;
+        uword addr = table + (uword)p->bg.next_tile_id * 16 + fine_y +
+                     (phase == 6 ? 8 : 0);
+        ubyte pattern = 0;
+
+        if (!read_ppu(p, addr, &pattern)) {
+          pattern = 0;
+        }
+
+        if (phase == 4) {
+          p->bg.next_tile_pattern_low = pattern;
+        } else {
+          p->bg.next_tile_pattern_high = pattern;
+        }
+      } else if (phase == 7) {
+        p->bg.pattern_shift_low =
+            (p->bg.pattern_shift_low & 0xFF00) | p->bg.next_tile_pattern_low;
+        p->bg.pattern_shift_high =
+            (p->bg.pattern_shift_high & 0xFF00) | p->bg.next_tile_pattern_high;
+
+        p->bg.attribute_shift_low =
+            (p->bg.attribute_shift_low & 0xFF00) |
+            ((p->bg.next_tile_attribute & 1) ? 0xFF : 0);
+        p->bg.attribute_shift_high =
+            (p->bg.attribute_shift_high & 0xFF00) |
+            ((p->bg.next_tile_attribute & 2) ? 0xFF : 0);
+
+        if ((p->loopy.v & 0x001F) == 31) {
+          p->loopy.v &= (uword)~0x001F;
+          p->loopy.v ^= 0x0400;
+        } else {
+          p->loopy.v++;
+        }
+      }
+    } else if ((dot & 7) == 0) {
+      p->bg.pattern_shift_low <<= 1;
+      p->bg.pattern_shift_high <<= 1;
+      p->bg.attribute_shift_low <<= 1;
+      p->bg.attribute_shift_high <<= 1;
+    }
+  }
+
+  if (fetch_line && dot == 256) {
+    uword v = p->loopy.v;
+
+    if ((v & 0x7000) != 0x7000) {
+      v += 0x1000;
+    } else {
+      v &= (uword)~0x7000;
+      uword y = (v & 0x03E0) >> 5;
+
+      if (y == 29) {
+        y = 0;
+        v ^= 0x0800;
+      } else if (y == 31) {
+        y = 0;
+      } else {
+        y++;
+      }
+
+      v = (v & (uword)~0x03E0) | (y << 5);
+    }
+
+    p->loopy.v = v;
+  }
+
+  if (fetch_line && dot == 257) {
+    p->loopy.v = (p->loopy.v & 0xFBE0) | (p->loopy.t & 0x041F);
+  }
+
+  if (prerender && fetch_line && dot >= 280 && dot <= 304) {
+    p->loopy.v = (p->loopy.v & 0x841F) | (p->loopy.t & 0x7BE0);
+  }
+
+  if (render_line && dot >= 1 && dot <= 64 && (dot & 1) == 0) {
+    p->sprite.secondary_oam[(dot >> 1) - 1] = 0xFF;
+  }
+
+  if (render_line && dot == 1) {
+    p->sprite.secondary_oam_addr = 0;
+    p->sprite.eval_n = 0;
+    p->sprite.eval_m = 0;
+    p->sprite.eval_latch = 0xFF;
+    p->sprite.eval_count = 0;
+    p->sprite.eval_sec_addr = 0;
+    p->sprite.eval_done = false;
+    p->sprite.sprite_overflow = false;
+    p->sprite.sprite_zero_rendering = false;
+  }
+
+  if (render_line && rendering && dot >= 65 && dot <= 256) {
+    if (dot & 1) {
+      if (p->sprite.eval_n < 64) {
+        p->sprite.eval_latch =
+            p->sprite.oam[(uword)p->sprite.eval_n * 4 + p->sprite.eval_m];
+      } else {
+        p->sprite.eval_latch = 0xFF;
+      }
+    } else if (!p->sprite.eval_done) {
+      uword target = prerender ? 0 : scanline + 1;
+      uword height = (p->reg.PPUCTRL & 0x20) ? 16 : 8;
+
+      if (p->sprite.eval_n >= 64) {
+        p->sprite.eval_done = true;
+      } else if (p->sprite.eval_count < 8) {
+        if (p->sprite.eval_m == 0) {
+          ubyte y = p->sprite.eval_latch;
+          ubyte row = (ubyte)(target - (uword)y - 1);
+
+          if (row < height) {
+            p->sprite.secondary_oam[p->sprite.eval_sec_addr++] = y;
+            p->sprite.eval_m = 1;
+
+            if (p->sprite.eval_n == 0) {
+              p->sprite.sprite_zero_rendering = true;
+            }
+          } else {
+            p->sprite.eval_n++;
+          }
+        } else {
+          p->sprite.secondary_oam[p->sprite.eval_sec_addr++] =
+              p->sprite.eval_latch;
+          p->sprite.eval_m++;
+
+          if (p->sprite.eval_m == 4) {
+            p->sprite.eval_m = 0;
+            p->sprite.eval_n++;
+            p->sprite.eval_count++;
+          }
+        }
+
+        if (p->sprite.eval_sec_addr >= 32) {
+          p->sprite.eval_count = 8;
+        }
+      } else {
+        ubyte row = (ubyte)(target - (uword)p->sprite.eval_latch - 1);
+
+        if (row < height) {
+          p->reg.PPUSTATUS |= 0x20;
+          p->sprite.sprite_overflow = true;
+          p->sprite.eval_m = (p->sprite.eval_m + 1) & 3;
+        }
+
+        p->sprite.eval_n++;
+      }
+    }
+  }
+
+  if (render_line && dot >= 257 && dot <= 320) {
+    uword slot = (dot - 257) >> 3;
+    uword phase = (dot - 257) & 7;
+
+    if (dot == 257) {
+      p->sprite.next_sprite_count = p->sprite.eval_count;
+      for (int i = 0; i < 8; i++) {
+        p->sprite.next_x[i] = 0xFF;
+        p->sprite.next_attributes[i] = 0xFF;
+        p->sprite.next_pattern_low[i] = 0;
+        p->sprite.next_pattern_high[i] = 0;
+      }
+    }
+
+    if (fetch_line && phase == 0) {
+      ubyte ignored = 0;
+      read_ppu(p, 0x2000 | (p->loopy.v & 0x0FFF), &ignored);
+    }
+
+    if (slot < 8 && slot < p->sprite.eval_count) {
+      ubyte y = p->sprite.secondary_oam[slot * 4];
+      ubyte tile = p->sprite.secondary_oam[slot * 4 + 1];
+      ubyte attr = p->sprite.secondary_oam[slot * 4 + 2];
+      ubyte x = p->sprite.secondary_oam[slot * 4 + 3];
+
+      if (phase == 0) {
+        p->sprite.next_x[slot] = x;
+        p->sprite.next_attributes[slot] = attr;
+      }
+
+      if (fetch_line && (phase == 4 || phase == 6)) {
+        uword target = prerender ? 0 : scanline + 1;
+        uword height = (p->reg.PPUCTRL & 0x20) ? 16 : 8;
+        uword row = (ubyte)(target - (uword)y - 1);
+
+        if (attr & 0x80) {
+          row = height - 1 - row;
+        }
+
+        uword addr;
+
+        if (height == 16) {
+          uword table = (tile & 1) ? 0x1000 : 0;
+          uword tile_index = tile & 0xFE;
+
+          if (row >= 8) {
+            tile_index++;
+            row -= 8;
+          }
+
+          addr = table + tile_index * 16 + row;
+        } else {
+          uword table = (p->reg.PPUCTRL & 0x08) ? 0x1000 : 0;
+          addr = table + (uword)tile * 16 + row;
+        }
+
+        if (phase == 6) {
+          addr += 8;
+        }
+
+        ubyte value = 0;
+        if (!read_ppu(p, addr, &value)) {
+          value = 0;
+        }
+
+        if (phase == 4) {
+          p->sprite.next_pattern_low[slot] = value;
+        } else {
+          p->sprite.next_pattern_high[slot] = value;
+        }
+      }
+    } else if (fetch_line && (phase == 4 || phase == 6)) {
+      ubyte ignored = 0;
+      uword addr = phase == 4 ? 0x0000 : 0x0008;
+      read_ppu(p, addr, &ignored);
+    }
+  }
+
+  if (visible && dot >= 1 && dot <= 256 && rendering) {
+    for (int i = 0; i < p->sprite.sprite_count && i < 8; i++) {
+      if (p->sprite.x[i] != 0) {
+        p->sprite.x[i]--;
+      } else {
+        p->sprite.pattern_low[i] <<= 1;
+        p->sprite.pattern_high[i] <<= 1;
+      }
+    }
+  }
+
+  if (scanline == 241 && dot == 1) {
+    if (!p->state.suppress_vblank && !p->state.vblank_suppressed &&
+        !p->state.status_read_during_vblank) {
+      p->timing.nmi_occurred = true;
+      p->reg.PPUSTATUS |= 0x80;
+      p->state.vblank_started = true;
+      update_nmi_line(p);
+      p->timing.frame_complete = true;
+    }
+
+    p->state.suppress_vblank = false;
+    p->state.vblank_suppressed = false;
+    p->state.status_read_during_vblank = false;
+  }
+
+  if (prerender && dot == 1) {
+    p->timing.nmi_occurred = false;
+    p->reg.PPUSTATUS &= (ubyte)~0xE0;
+    p->state.vblank_started = false;
+    p->state.vblank_suppressed = false;
+    p->state.status_read_during_vblank = false;
+    update_nmi_line(p);
+  }
+
+  if (prerender && rendering && dot == 339 && p->timing.odd_frame) {
+    p->timing.dot = 0;
+    p->timing.scanline = 0;
+    p->timing.frames++;
+    p->timing.odd_frame = false;
+    p->timing.frame_complete = false;
+    return;
+  }
+
+  if (dot == 340) {
+    p->timing.dot = 0;
+
+    if (scanline == 261) {
+      p->timing.scanline = 0;
+      p->timing.frames++;
+      p->timing.odd_frame = !p->timing.odd_frame;
+      p->timing.frame_complete = false;
+    } else {
+      p->timing.scanline = scanline + 1;
+    }
+  } else {
+    p->timing.dot = dot + 1;
+  }
 }
 
 static void __clock_nes_ppu_pal(NES_PPU *p) {
